@@ -1,0 +1,22 @@
+# 打包产物
+build/
+dist/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 运行期产物
+*.log
+*.log.[0-9]
+
+# ★ 每台机器都不一样，而且**含 PSK**，绝不能提交
+config.toml
+
+# 编辑器 / 系统
+.venv/
+venv/
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
