@@ -243,3 +243,23 @@ def test_format_allowed_reports_reason():
 
     allowed, why = policy.format_allowed("CF_UNICODETEXT", CAT_TEXT)
     assert allowed and why == ""
+
+def test_exclude_patterns_override_replaces_the_configured_exclude():
+    """传了 `exclude_patterns` 就**用它**，而不是配置里那一套。
+
+    这是"按复制来源进程切换丢弃列表"的底座：同一个 `Ole Private Data` 在
+    WPS 演示上要排掉、在 Word 上要留着，静态配置无论怎么配都只能满足一边。
+    """
+    from netclip.clipsync.policy import SyncPolicy
+
+    policy = SyncPolicy(exclude=[r"^Ole Private Data$"])
+    assert policy.format_allowed("Ole Private Data", "ole")[0] is False
+
+    #: 覆盖成"什么都不排" —— 又允许了
+    assert policy.format_allowed("Ole Private Data", "ole", policy.compile_exclude([]))[0] is True
+    #: 覆盖成另一套 —— 按新的来
+    only_text = policy.compile_exclude([r"^CF_UNICODETEXT$"])
+    assert policy.format_allowed("CF_UNICODETEXT", "text", only_text)[0] is False
+    assert policy.format_allowed("Ole Private Data", "ole", only_text)[0] is True
+    #: 不传 = 老行为，没配这个功能的人完全不受影响
+    assert policy.format_allowed("Ole Private Data", "ole")[0] is False

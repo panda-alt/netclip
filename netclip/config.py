@@ -84,6 +84,38 @@ def _as_float(value: Any, path: str) -> float:
     return float(value)
 
 
+def _as_exclude_rules(value: Any) -> List[Dict[str, Any]]:
+    """解析 `clipboard.formats.exclude_by_process`。
+
+    每项必须是 `{ process = "xxx.exe", exclude = ["正则", ...] }`。
+    进程名做小写归一；`exclude` 里的正则**当场编译一次**，非法就报错（别等到采集时才炸）。
+    """
+    if value in (None, ""):
+        return []
+    if not isinstance(value, list):
+        raise ConfigError("clipboard.formats.exclude_by_process 必须是数组，得到 %r" % (value,))
+    rules: List[Dict[str, Any]] = []
+    for index, item in enumerate(value):
+        where = "clipboard.formats.exclude_by_process[%d]" % index
+        if not isinstance(item, dict):
+            raise ConfigError("%s 必须是表 { process = ..., exclude = [...] }，得到 %r" % (where, item))
+        process = item.get("process")
+        if not isinstance(process, str) or not process.strip():
+            raise ConfigError("%s.process 必须是非空字符串" % where)
+        patterns = item.get("exclude", [])
+        if not isinstance(patterns, list) or any(not isinstance(p, str) for p in patterns):
+            raise ConfigError("%s.exclude 必须是字符串数组" % where)
+        for pattern in patterns:
+            try:
+                import re
+
+                re.compile(pattern)
+            except re.error as exc:
+                raise ConfigError("%s.exclude 里的正则非法 %r: %s" % (where, pattern, exc)) from None
+        rules.append({"process": process.strip().lower(), "exclude": list(patterns)})
+    return rules
+
+
 def _as_bool(value: Any, path: str) -> bool:
     if not isinstance(value, bool):
         raise ConfigError("%s 必须是 true/false，得到 %r" % (path, value))
@@ -249,12 +281,47 @@ def default_receive_dir() -> str:
 @dataclass
 class ClipboardFormatsConfig:
     forward_all: bool = True
-    exclude: List[str] = field(
-        default_factory=lambda: [r"^DataObject$", r"^Ole Private Data$", r"^Link Source.*"]
-    )
+    #: 暂时**一条都不排除** —— 这是"能粘、但退成图片"那一组实测状态。
+    #:
+    #: 真机 A/B 记录（同一个剪贴板，两台各跑一次 `tools/clip_probe.py`）：
+    #:
+    #:   | 排除 | 接收端 | 结果 |
+    #:   |---|---|---|
+    #:   | DataObject + Ole Private Data + Link Source* | 13 种 | 菜单灰，完全粘不了 |
+    #:   | 一条不排 | 18 种 | 能粘，但退成图片 |
+    #:   | DataObject + Ole Private Data | 16 种 | 能粘，可编辑（**UU远程 的行为**）|
+    #:
+    #: **但这三组之间不止一个变量不同**：UU远程 除了不转发 `Ole Private Data`，
+    #: 也**不改 HTML**（两边 HTML 逐字节一致），而我们会把 `file:///` 图片内联成
+    #: data URI。所以"到底是哪一个导致的退成图片"还没定论，正在**逐个隔离**：
+    #: 先只关 `inline_html_refs`，其余保持不动。
+    #:
+    #: `Link Source` 系列现在能确定**不能排除** —— 第一组里它被排掉，结果是菜单灰。
+    exclude: List[str] = field(default_factory=list)
+    #: **按"复制来源进程"切换丢弃列表。**
+    #:
+    #: 为什么需要它：同一个 `Ole Private Data` 在不同程序上要求**相反** ——
+    #: WPS 演示（`wpp.exe`）要它不在（否则形状/文本框退成图片），
+    #: Word（`winword.exe`）要它在（否则文字粘不了）。8 种组合的真机枚举证明
+    #: **没有任何一组静态 `exclude` 能两边都满足**。
+    #:
+    #: 判据用**进程名**（剪贴板所有者），因为那是直接可观测的，不用猜格式。
+    #: 每项形如 `{ process = "wpp.exe", exclude = ["^Ole Private Data$"] }`；
+    #: 匹配不到就用上面的 `exclude`。进程名按小写、精确匹配文件名。
+    exclude_by_process: List[Dict[str, Any]] = field(default_factory=list)
     per_format_max_mb: int = 100
     compress: bool = True
     inline_html_refs: bool = True
+    #: 写完对端剪贴板后，让 **OLE 正式接管**（`OleGetClipboard` -> `OleSetClipboard`
+    #: -> `OleFlushClipboard`），由 OLE 生成属于**本机**的数据对象身份。
+    #:
+    #: 背景：裸 `SetClipboardData` 写出来的剪贴板没有 OLE 数据对象的身份，而
+    #: Office/WPS 的粘贴走 `OleGetClipboard`。对照组 UU远程 送过来的同一份内容
+    #: 对端粘出来是**可编辑对象**，它的剪贴板**有所有者窗口**。
+    #:
+    #: **默认关**：本机实测里这一步会把剪贴板清空（`CLIPBRD_E_CANT_CLOSE`）。
+    #: 接管后有"格式有没有变少"的自检和回滚，但在真机上证明有用之前不开。
+    ole_finish: bool = False
     allow_private: List[str] = field(default_factory=list)
     #: 还原时写回剪贴板的格式顺序（先匹配到的先写），未列出的按原始顺序追加
     paste_priority: List[str] = field(
@@ -602,6 +669,18 @@ def _parse_clipboard_formats(raw: Dict[str, Any]) -> ClipboardFormatsConfig:
     cfg.inline_html_refs = _as_bool(
         _get(raw, "inline_html_refs", "clipboard.formats.inline_html_refs", cfg.inline_html_refs),
         "clipboard.formats.inline_html_refs",
+    )
+    cfg.ole_finish = _as_bool(
+        _get(raw, "ole_finish", "clipboard.formats.ole_finish", cfg.ole_finish),
+        "clipboard.formats.ole_finish",
+    )
+    cfg.exclude_by_process = _as_exclude_rules(
+        _get(
+            raw,
+            "exclude_by_process",
+            "clipboard.formats.exclude_by_process",
+            cfg.exclude_by_process,
+        )
     )
     cfg.allow_private = _as_str_list(
         _get(raw, "allow_private", "clipboard.formats.allow_private", cfg.allow_private), "clipboard.formats.allow_private"

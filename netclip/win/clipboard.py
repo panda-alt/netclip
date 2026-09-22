@@ -22,6 +22,7 @@ import logging
 import os
 import struct
 import subprocess
+import threading
 import time
 from ctypes import wintypes
 from dataclasses import dataclass, field
@@ -225,12 +226,23 @@ class ClipboardSession:
     """`with ClipboardSession(): ...` —— 保证一定 CloseClipboard。
 
     打开失败按退避重试；用尽仍失败抛 `ClipboardBusy`。
+
+    `owner` 是要登记成**剪贴板所有者**的窗口句柄（0 = 不指定）。
+
+    **为什么值得指定。** 不指定时剪贴板所有者是 NULL，而对端（Office/WPS）的粘贴走
+    `OleGetClipboard`，它要跟所有者打交道。真机对照：UU远程 送过来的同一份内容对端
+    粘出来是**可编辑对象**，而它的剪贴板**有一个所有者窗口**（GameViewer.exe），
+    我们的一直是**无主**。所以这里允许把剪贴板监听线程那个 message-only 窗口登记进去
+    ——那个线程本来就在抽消息，正好满足"所有者窗口要能收消息"的要求。
     """
 
-    __slots__ = ("retry_ms", "_opened", "_owner_handle")
+    __slots__ = ("retry_ms", "_opened", "_owner_handle", "owner")
 
-    def __init__(self, retry_ms: Tuple[int, ...] = DEFAULT_OPEN_RETRY_MS) -> None:
+    def __init__(
+        self, retry_ms: Tuple[int, ...] = DEFAULT_OPEN_RETRY_MS, owner: int = 0
+    ) -> None:
         self.retry_ms = tuple(retry_ms) if retry_ms else DEFAULT_OPEN_RETRY_MS
+        self.owner = int(owner or 0)
         self._opened = False
         self._owner_handle = None
 
@@ -240,7 +252,7 @@ class ClipboardSession:
             if not first:
                 time.sleep(delay / 1000.0)
             first = False
-            if w.user32.OpenClipboard(None):
+            if w.user32.OpenClipboard(self.owner or None):
                 self._opened = True
                 # 记住当前 owner：判断"这次写入到底有没有生效"时有用
                 self._owner_handle = w.user32.GetClipboardOwner()
@@ -550,6 +562,22 @@ def _capture_once(
             ordered = sorted(available, key=lambda pair: group_rank(pair[1])) if dedupe_groups else available
             satisfied_groups: Dict[int, str] = {}
 
+            #: **读取顺序和输出顺序是两回事。**
+            #:
+            #: 上面那个排序只是为了决定"同一组等价表示里留哪一个"；而 `items` 的**顺序**
+            #: 会被接收端原样照搬去写剪贴板 —— 也就是说，**排序会泄漏成接收端的格式
+            #: 枚举顺序**。消费者是照枚举顺序挑格式的，我们没理由替它重排。
+            #:
+            #: 真机证据（同一个剪贴板，两台各跑一次 `tools/clip_probe.py`）::
+            #:
+            #:     发送端: DataObject > Kingsoft Data Descriptor > Kingsoft WPS 9.0 Format > …
+            #:     接收端: CF_UNICODETEXT > CF_ENHMETAFILE > DataObject > Kingsoft Data Descriptor > …
+            #:             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ 被我们提到了最前面
+            #:
+            #: 所以这里按**原始枚举位置**收结果，读完再摆回去。
+            position = {fmt: index for index, (fmt, _name) in enumerate(available)}
+            picked: "Dict[int, FormatBlob]" = {}
+
             for fmt, name in ordered:
                 category = classify_format(fmt, name)
                 group_index: Optional[int] = None
@@ -575,7 +603,10 @@ def _capture_once(
 
                 if dedupe_groups and group_index is not None:
                     satisfied_groups[group_index] = name
-                snapshot.items.append(blob)
+                picked[position.get(fmt, len(picked))] = blob
+
+            #: 按剪贴板上的**原始枚举顺序**输出（顺序本身就是被转发的一部分）。
+            snapshot.items = [picked[key] for key in sorted(picked)]
     except ClipboardBusy as exc:
         snapshot.skipped.append(("<剪贴板>", str(exc)))
         return snapshot, False
@@ -620,8 +651,12 @@ class ClipboardWriteResult:
 def write_formats(
     items: List[FormatBlob],
     open_retry_ms: Tuple[int, ...] = DEFAULT_OPEN_RETRY_MS,
+    owner: int = 0,
 ) -> ClipboardWriteResult:
     """把一组格式写入剪贴板。
+
+    `owner` 是登记成**剪贴板所有者**的窗口句柄（0 = 不指定）——
+    见 `ClipboardSession` 的说明：无主剪贴板和对端 OLE 的粘贴有关系。
 
     顺序很重要：`CF_EMBEDDEDOBJECT` 必须在最后写，否则 Office 认不出嵌入对象。
     调用方负责排好序（见 `order_for_paste`）。
@@ -651,7 +686,7 @@ def write_formats(
         written = []
         failed = []
         try:
-            with ClipboardSession(open_retry_ms):
+            with ClipboardSession(open_retry_ms, owner=owner):
                 if not w.user32.EmptyClipboard():
                     last_err = w.last_error()
                     if _DIAG_EMPTY:
@@ -1075,6 +1110,134 @@ def clear_clipboard(retry_ms: Tuple[int, ...] = DEFAULT_OPEN_RETRY_MS) -> bool:
             return bool(w.user32.EmptyClipboard())
     except ClipboardBusy:
         return False
+
+
+def clipboard_owner_process() -> str:
+    """剪贴板上这份内容**是哪个进程放的**（可执行文件名，小写）。取不到返回空串。
+
+    必须在**剪贴板已打开**的会话里意义才准确，所以调用方一般在 `capture()` 之前、
+    或紧跟着读一次。真机用途见 `config.example.toml` 的 `exclude_by_process`：
+
+    同一个 `Ole Private Data` 在 WPS 演示（`wpp.exe`）和 Word（`winword.exe`）上
+    要求**相反**，而"谁放的"是直接可观测的，不需要猜格式。
+    """
+    try:
+        hwnd = w.user32.GetClipboardOwner()
+        if not hwnd:
+            #: 无主时退回"正持有剪贴板的那个窗口"——我们自己写完之后就是这种状态，
+            #: 而那时我们要知道的恰恰是"我们没抢到谁的内容"。
+            return ""
+        pid = wintypes.DWORD(0)
+        w.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        handle = w.kernel32.OpenProcess(w.PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+        if not handle:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(len(buf))
+            if not w.kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+                return ""
+            return os.path.basename(buf.value).lower()
+        finally:
+            w.kernel32.CloseHandle(handle)
+    except Exception:  # pragma: no cover - 拿不到就当"不知道来源"，退回默认排除表
+        log.debug("取剪贴板所有者进程失败", exc_info=True)
+        return ""
+
+
+# --------------------------------------------------------------------- OLE 收尾
+
+
+#: 已经 `OleInitialize` 过的线程（每个线程只需一次）。
+_OLE_READY: "set" = set()
+_OLE_LOCK = threading.Lock()
+
+
+def _ole_initialize() -> bool:
+    """在当前线程上初始化 OLE（幂等）。`OleInitialize` 必须在用任何 OLE 函数之前调。"""
+    key = threading.get_ident()
+    with _OLE_LOCK:
+        if key in _OLE_READY:
+            return True
+    #: S_OK=0、S_FALSE=1（已经初始化过）都算成功
+    if w.ole32.OleInitialize(None) in (0, 1):
+        with _OLE_LOCK:
+            _OLE_READY.add(key)
+        return True
+    return False
+
+
+def _release_com(ptr) -> None:
+    """`IUnknown::Release`（vtable 第 3 个槽）。不实现任何接口，只是把引用还回去。"""
+    try:
+        vtable = ctypes.cast(ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
+        ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtable[2])(ptr)
+    except Exception:  # pragma: no cover - 释放失败只是泄漏一个引用，不该影响功能
+        pass
+
+
+def _clipboard_format_names() -> "set":
+    try:
+        with ClipboardSession():
+            return {name for _fmt, name in enumerate_formats()}
+    except ClipboardBusy:
+        return set()
+
+
+def bless_clipboard_with_ole() -> bool:
+    """让 **OLE 正式接管**当前剪贴板。
+
+    为什么可能有用（真机 A/B 的推论，尚未定论）
+    -------------------------------------------
+    裸 `SetClipboardData` 写出来的剪贴板**没有 OLE 数据对象的身份** —— 用
+    `OpenClipboard(None)` 写的话，剪贴板所有者是 NULL，而 Office/WPS 的粘贴走的是
+    `OleGetClipboard`。对照组：UU远程（GameViewer.exe）送过来的同一份内容
+    **接收端粘出来是可编辑对象**，而它的剪贴板**有所有者窗口**、**没有**
+    `Ole Private Data`。
+
+    这里不做任何 COM 实现：`OleGetClipboard` 拿到 OLE 对当前剪贴板的封装，
+    再 `OleSetClipboard` 交还给它，由 OLE 生成属于**本机**的私有数据 ——
+    而不是把源机器的封送引用（悬空引用）原样搬过来。
+
+    **必须自检，因为它可能把剪贴板清空。** 实测（本机，干净流程）出现过::
+
+        OleSetClipboard = CLIPBRD_E_CANT_CLOSE
+        之后剪贴板里只剩下 ['DataObject']  —— 我们写的内容全没了
+
+    所以接管之后要**核对格式有没有变少**；少了就返回 False，由调用方把原内容重写回去。
+    宁可不要这个改善，也绝不能把用户的剪贴板弄丢。
+    """
+    before = _clipboard_format_names()
+    if not before:
+        return False
+    if not _ole_initialize():
+        log.debug("OleInitialize 失败，不做 OLE 接管")
+        return False
+
+    ptr = ctypes.c_void_p()
+    try:
+        if w.ole32.OleGetClipboard(ctypes.byref(ptr)) != 0 or not ptr:
+            log.debug("OleGetClipboard 失败，不做 OLE 接管")
+            return False
+        if w.ole32.OleSetClipboard(ptr) != 0:
+            log.debug("OleSetClipboard 失败")
+            return False
+        if w.ole32.OleFlushClipboard() != 0:
+            log.debug("OleFlushClipboard 失败")
+            return False
+    except Exception:  # pragma: no cover - OLE 出问题不能影响同步
+        log.debug("OLE 接管异常", exc_info=True)
+        return False
+    finally:
+        _release_com(ptr)
+
+    after = _clipboard_format_names()
+    lost = before - after
+    if lost:
+        log.warning("OLE 接管后少了 %d 种格式（%s）—— 判定失败", len(lost), sorted(lost)[:4])
+        return False
+    log.debug("OLE 已接管剪贴板（%d 种格式，一种没少）", len(after))
+    return True
 
 
 # --------------------------------------------------------------------- CF_HDROP

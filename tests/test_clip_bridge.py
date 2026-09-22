@@ -287,8 +287,129 @@ def test_inline_html_handles_href():
         assert b"data:text/css;base64," in out
 
 
-# ------------------------------------------------------- 携带路径的格式必须挡掉
+# --------------------------------------------------- CF_HTML 头里的偏移必须重算
 
+def _make_cf_html(body: bytes) -> bytes:
+    """拼一份结构和真实剪贴板一致的 CF_HTML（头 + 正文，偏移 10 位零填充）。"""
+    header_size = (
+        b"Version:1.0\r\nStartHTML:0000000000\r\nEndHTML:0000000000\r\n"
+        b"StartFragment:0000000000\r\nEndFragment:0000000000\r\n"
+    )
+    start_html = len(header_size)
+    start_fragment = start_html + body.index(b"<!--StartFragment-->") + len(b"<!--StartFragment-->")
+    end_fragment = start_html + body.index(b"<!--EndFragment-->")
+    header = (
+        b"Version:1.0\r\nStartHTML:%010d\r\nEndHTML:%010d\r\n"
+        b"StartFragment:%010d\r\nEndFragment:%010d\r\n"
+        % (start_html, start_html + len(body), start_fragment, end_fragment)
+    )
+    assert len(header) == len(header_size), "头的长度必须固定，否则偏移会整体平移"
+    return header + body
+
+
+def _cf_html_offset(data: bytes, name: str) -> int:
+    import re
+
+    return int(re.search((name + r":(\d+)").encode(), data).group(1))
+
+
+def test_cf_html_fixture_is_self_consistent():
+    """先确认测试用的夹具本身是对的 —— 否则后面的断言没有意义。"""
+    body = b"<html><body><!--StartFragment--><p>x</p><!--EndFragment--></body></html>"
+    data = _make_cf_html(body)
+    assert _cf_html_offset(data, "EndHTML") == len(data)
+    assert data[_cf_html_offset(data, "StartFragment") : _cf_html_offset(data, "EndFragment")] == b"<p>x</p>"
+
+
+def test_inlining_fixes_the_cf_html_offsets():
+    """**回归测试**：内联图片改了正文，就必须重算头里的偏移量。
+
+    真机上踩到的现象：WPS 复制一个带公式的段落，对端粘出来**变成了图片**。
+    抓到的直接证据是同一个剪贴板在两台机器上的两份 `clip_probe.py` 输出::
+
+        发送端 HTML Format: 33411 字节   头里 EndHTML:0000033411   <- 自洽
+        接收端 HTML Format: 96570 字节   头里 EndHTML:0000033411   <- 早就不是这个数了
+
+    原因就是内联图片把正文改长了、偏移量却还停在改写前。消费者（WPS / 资源管理器）
+    照着旧偏移去切片段，切到断的片段就当作坏数据 —— 于是**放弃 HTML 回退成图片**。
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        png = os.path.join(tmp, "p.png")
+        with open(png, "wb") as fh:
+            fh.write(bytes(range(256)) * 8)
+        url = "file:///" + png.replace("\\", "/")
+        body = (
+            b"<html><body><!--StartFragment--><p>formula</p>"
+            b'<img src="' + url.encode("utf-8") + b'">'
+            b"<!--EndFragment--></body></html>"
+        )
+        data = _make_cf_html(body)
+        before = len(data)
+
+        out = inline_html_local_refs(data)
+
+        assert len(out) > before, "图片没被内联，这个用例就没意义了"
+        assert b"data:image/png;base64," in out
+        assert _cf_html_offset(out, "EndHTML") == len(out), "EndHTML 必须等于改写后的总长度"
+        assert _cf_html_offset(out, "StartHTML") == _cf_html_offset(data, "StartHTML"), (
+            "用同样的宽度写回去，正文起点不该移动"
+        )
+        #: 片段边界要能就地切出正文 —— 这正是消费者会做的事
+        fragment = out[
+            _cf_html_offset(out, "StartFragment") : _cf_html_offset(out, "EndFragment")
+        ]
+        assert fragment.startswith(b"<p>formula</p>")
+        assert b"base64," in fragment
+
+
+def test_fixup_ignores_data_that_is_not_cf_html():
+    """不是 CF_HTML 的负载一律不碰 —— 别把别人的格式改坏。"""
+    from netclip.clipsync.bridge import fixup_cf_html_offsets
+
+    plain = b"<html><body>StartHTML:0000000042</body></html>"
+    assert fixup_cf_html_offsets(plain) == plain
+
+
+def test_fixup_leaves_offsets_alone_when_the_width_would_grow():
+    """偏移位宽不够时宁可不改 —— 改坏头比不改更糟。"""
+    from netclip.clipsync.bridge import fixup_cf_html_offsets
+
+    #: `EndHTML` 只有 1 位，而真实长度远不止 9 —— 重写会把头撑长、正文起点平移，
+    #: 所以这里必须原样返回。
+    data = b"Version:1.0\r\nEndHTML:5\r\n<html><body>x</body></html>"
+    assert fixup_cf_html_offsets(data) == data
+
+
+def test_link_source_is_never_excluded_by_default():
+    """默认不排除 `Link Source` 系列 —— 这是**保守默认**，不是因果结论。
+
+    真机 A/B（同一个剪贴板，两台各跑一次 `tools/clip_probe.py`）：
+
+      | 排除 | 接收端 | 结果 |
+      |---|---|---|
+      | 三条（旧默认，含 `^Link Source.*`） | 13 种 | 菜单灰，**完全粘不了** |
+      | 一条不排 | 18 种 | 能粘，但退成图片 |
+
+    **注意这两组之间不止一个变量不同**：第一组同时丢了 `DataObject` /
+    `Ole Private Data` / `Link Source` / `Link Source Descriptor`，
+    所以"菜单灰"到底该怪谁**没有定论**（字节数 1087 = 90.1-89.0 KB 只说明丢的就是这四个）。
+
+    这里断言"不排除"的理由是**保守**：除非有证据证明某个格式必须排除，
+    否则不该替消费者拿掉东西 —— 旧默认那三条就是没证据就排掉的。
+    """
+    from netclip.config import ClipboardFormatsConfig, Config
+    from netclip.clipsync.factory import build_policy
+
+    assert not any("Link Source" in p for p in ClipboardFormatsConfig().exclude), (
+        "没有证据表明 Link Source 必须排除 —— 保守起见不要排"
+    )
+    policy = build_policy(Config())
+    for name in ("Link Source", "Link Source Descriptor"):
+        ok, reason = policy.format_allowed(name, "ole")
+        assert ok, "%s 被默认挡掉了（%s）" % (name, reason)
+
+
+# ------------------------------------------------------- 携带路径的格式必须挡掉
 
 class _Blob:
     """只需要 name 就够了，`writable_formats` 不碰其它字段。"""
@@ -365,6 +486,77 @@ def test_hdrop_is_still_sent_but_shell_idlist_is_not():
     assert collect_filter_skip(0, "Shell IDList Array"), "Shell IDList Array 不能发"
     assert collect_filter_skip(0, "FileNameW")
     assert "CF_HDROP" not in SHELL_PATH_FORMATS
+
+
+def test_remote_clipboard_writes_are_serialized():
+    """**回归测试**：写对端剪贴板必须**串行** —— 只能有一个写入者。
+
+    系统剪贴板是全局独占资源：`EmptyClipboard` + `SetClipboardData` 必须由一个
+    写入者从头做到尾。原先 `_commit` 每收到一帧就 `threading.Thread(...).start()`，
+    实测（这个用例复现的就是它）连着送 8 帧能让 **5 个线程同时抢同一个剪贴板** ——
+    互相把对方刚写进去的格式清掉。用户看到的是"**粘贴菜单是灰的**"：粘贴的那一刻，
+    剪贴板正好被另一个线程清空、或者只写了一半。
+
+    真机上触发这个的条件很容易满足：WPS 复制一次会连发十几帧（真机日志里同一份内容
+    2.5 秒内发了 3 次，还有 13/12/7 种格式的不同阶段）。
+    """
+    import threading
+    import time
+
+    import netclip.clipsync.bridge as bridge_mod
+    from netclip.clipsync.bridge import ClipboardSync
+
+    concurrent = 0
+    peak = 0
+    calls = 0
+    workers = set()
+    guard = threading.Lock()
+
+    def fake_write(items, **kwargs):
+        nonlocal concurrent, peak, calls
+        with guard:
+            concurrent += 1
+            calls += 1
+            peak = max(peak, concurrent)
+            workers.add(threading.current_thread().name)
+        time.sleep(0.15)  # 真实写入要抢锁/退避重试，这里只需制造重叠窗口
+        with guard:
+            concurrent -= 1
+        result = _Blob("(result)")
+        result.sequence = calls
+        return result
+
+    monkeypatch_original = bridge_mod.cb.write_formats
+    bridge_mod.cb.write_formats = fake_write
+    sync = _make_sync()
+    sync._watcher = None  # 不需要回声抑制，只测写入并发
+    try:
+        data = "公式".encode("utf-16-le")
+        meta = [
+            {
+                K_NAME: "CF_UNICODETEXT",
+                K_SIZE: len(data),
+                K_CAT: CAT_TEXT,
+                K_ZLIB: False,
+            }
+        ]
+        for index in range(8):
+            sync._commit("id%d" % index, index, meta, [data], source="test")
+            time.sleep(0.02)
+
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            with guard:
+                if concurrent == 0 and calls > 0:
+                    break
+            time.sleep(0.05)
+
+        assert peak == 1, "有 %d 个线程在同时写剪贴板，它们会互相擦除" % peak
+        assert workers == {"netclip-clip-apply"}, "写入者应该是那个唯一的线程: %s" % workers
+        assert calls < 8, "中间态应该被后到的帧顶掉，实际写了 %d 次" % calls
+    finally:
+        bridge_mod.cb.write_formats = monkeypatch_original
+        sync.stop(timeout=1.0)
 
 
 def test_built_file_clipboard_writes_no_shell_idlist():
@@ -709,3 +901,37 @@ def test_powershell_failure_falls_back_to_builtin_writer(monkeypatch):
 
     assert fake.written, "回退分支没有写剪贴板"
     assert "CF_HDROP" in fake.written[-1]
+
+def test_exclude_by_process_selects_the_rule_for_the_copying_process():
+    """按"复制来源进程"切换丢弃列表。
+
+    真机枚举了 3 条正则的 8 种组合，结论是**没有任何一组静态 `exclude` 能两边都满足**：
+
+      | Ole Private Data | PPT（wpp.exe） | Word（winword.exe） |
+      |---|---|---|
+      | 排掉 | 可编辑 ✅ | 粘不了 ❌ |
+      | 原样转发 | 退成图片 ❌ | 可以 ✅ |
+
+    所以判据只能用**进程名**（剪贴板所有者）—— 那是直接可观测的，不用猜格式。
+    """
+    from netclip.config import Config
+    from netclip.clipsync.bridge import ClipboardSync
+    from netclip.clipsync.factory import build_policy
+
+    sync = ClipboardSync(
+        policy=build_policy(Config()),
+        send=lambda *a: None,
+        exclude_by_process=[
+            {"process": "wpp.exe", "exclude": [r"^Ole Private Data$"]},
+            {"process": "WinWord.EXE", "exclude": []},
+        ],
+    )
+
+    assert [p.pattern for p in sync._exclude_for_owner("wpp.exe")] == [  # noqa: SLF001
+        r"^Ole Private Data$"
+    ]
+    #: 空列表 = 显式"什么都不排"（Word 要留着 Ole Private Data）
+    assert sync._exclude_for_owner("WINWORD.EXE") == []  # noqa: SLF001
+    #: 没匹配到 = None，表示"用全局 exclude"，**不是**"什么都不排"
+    assert sync._exclude_for_owner("chrome.exe") is None  # noqa: SLF001
+    assert sync._exclude_for_owner("") is None  # noqa: SLF001

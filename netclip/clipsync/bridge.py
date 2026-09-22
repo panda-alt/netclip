@@ -110,7 +110,7 @@ def writable_formats(items: List[Any]) -> List[Any]:
     return [i for i in items if i.name not in cb.NEVER_WRITE_FORMATS]
 
 
-def make_collect_filter(policy: SyncPolicy):
+def make_collect_filter(policy: SyncPolicy, exclude_patterns: "Optional[Sequence[object]]" = None):
     """生成采集阶段的过滤回调。**必须在剪贴板已打开的状态下调用**。
 
     分两层，顺序固定：
@@ -141,7 +141,7 @@ def make_collect_filter(policy: SyncPolicy):
     def filter_fn(fmt: int, name: str, category: str) -> bool:
         if cb.collect_filter_skip(fmt, name):
             return False
-        return policy.format_allowed(name, category)[0]
+        return policy.format_allowed(name, category, exclude_patterns)[0]
 
     return filter_fn
 
@@ -166,6 +166,8 @@ class ClipboardSync:
         send: Callable[[int, Dict, bytes, Optional[str]], None],
         compress: bool = True,
         inline_html_refs: bool = True,
+        ole_finish: bool = False,
+        exclude_by_process: "Optional[Sequence[Dict[str, Any]]]" = None,
         notify: Optional[Callable[[str, str], None]] = None,
         files_handler: Optional[Any] = None,
     ) -> None:
@@ -178,6 +180,20 @@ class ClipboardSync:
         self.send = send
         self.compress = compress
         self.inline_html_refs = inline_html_refs
+        #: 写完对端剪贴板后是否让 OLE 正式接管（见 `clipboard.bless_clipboard_with_ole`）。
+        #: 默认关 —— 它在**本机实测里会把剪贴板清空**，虽然接管后有自检和回滚，
+        #: 但在真机上证明有用之前不该默认打开。
+        self.ole_finish = ole_finish
+        #: **按复制来源进程切换的丢弃列表。** 正则**在这里就编译好**，
+        #: 免得每次采集都重编译一遍。见 `config.ClipboardFormatsConfig.exclude_by_process`。
+        self._exclude_by_process: "List[Tuple[str, List[Any]]]" = [
+            (
+                str(rule.get("process", "")).strip().lower(),
+                self.policy.compile_exclude(rule.get("exclude") or []),
+            )
+            for rule in (exclude_by_process or [])
+            if str(rule.get("process", "")).strip()
+        ]
         self.notify = notify or (lambda level, text: None)
         self.files_handler = files_handler
 
@@ -219,6 +235,21 @@ class ClipboardSync:
         #: 因为这次写入马上就会把剪贴板覆盖掉。
         self._writing = threading.Event()
 
+        #: **对端剪贴板帧的写入队列 —— 只保留最新一帧。**
+        #:
+        #: 系统剪贴板是**全局独占**资源，`EmptyClipboard` + `SetClipboardData` 必须
+        #: 由一个写入者从头做到尾。原先这里每收到一帧就开一个线程去写，实测
+        #: （`tests/test_clip_bridge.py`）连着送 8 帧能让 **5 个线程同时抢剪贴板** ——
+        #: 它们互相把对方刚写进去的格式清掉，结果是"**粘贴菜单是灰的**"：用户粘贴的
+        #: 那一刻，剪贴板正好被另一个线程清空、或者只写了一半。
+        #:
+        #: 而且中间态本来就没有价值：WPS 复制一次会连发十几帧（真机日志里同一份内容
+        #: 2.5 秒内发了 3 次，还有 13/12/7 种格式的不同阶段），只有最后一帧是完整的。
+        #: 所以这里不是排队，是**后到的顶掉前面的**。
+        self._apply_pending: Optional["Tuple[int, List[cb.FormatBlob]]"] = None
+        self._apply_wake = threading.Event()
+        self._apply_thread: Optional[threading.Thread] = None
+
         self.stats = {
             "sent": 0,
             "recv": 0,
@@ -246,17 +277,36 @@ class ClipboardSync:
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="netclip-clip-sync", daemon=True)
         self._thread.start()
+        self._ensure_apply_thread()
         log.info("剪贴板同步已启动")
 
     def stop(self, timeout: float = 2.0) -> None:
         self._stop.set()
+        self._apply_wake.set()  # 叫醒写入线程，让它看到 _stop
         if self._watcher is not None:
             self._watcher.stop()
         if self._thread is not None:
             self._thread.join(timeout)
             self._thread = None
+        if self._apply_thread is not None:
+            self._apply_thread.join(timeout)
+            self._apply_thread = None
         self._running = False
         log.info("剪贴板同步已停止")
+
+    def _ensure_apply_thread(self) -> None:
+        """按需启动**唯一的**剪贴板写入线程（幂等）。
+
+        见 `_apply_pending` 的说明：剪贴板是全局独占资源，只能有一个写入者。
+        做成按需启动是为了让 `_commit` 不依赖"`start()` 一定先被调用过"——
+        否则 `start()` 之前到的帧会被静默丢掉。
+        """
+        if self._apply_thread is not None and self._apply_thread.is_alive():
+            return
+        self._apply_thread = threading.Thread(
+            target=self._apply_loop, name="netclip-clip-apply", daemon=True
+        )
+        self._apply_thread.start()
 
     def on_net_state(self, state: Any) -> None:
         """会话在网络状态变化时调用（可能在事件循环线程里）。"""
@@ -302,9 +352,17 @@ class ClipboardSync:
 
     def publish_local(self) -> SyncDecision:
         """采集本机剪贴板并发送。返回决策结果（也供手动触发/测试使用）。"""
+        #: **先问"这份内容是谁放的"**，再决定这次要丢哪些格式。
+        #: 同一个 `Ole Private Data` 在 WPS 演示和 Word 上要求相反，静态配置无解 ——
+        #: 判据只能是来源进程（见 `config.ClipboardFormatsConfig.exclude_by_process`）。
+        owner = cb.clipboard_owner_process()
+        exclude_patterns = self._exclude_for_owner(owner)
+        if exclude_patterns is not None:
+            log.debug("按来源进程 %s 切换丢弃列表：%d 条规则", owner, len(exclude_patterns))
+
         snapshot = cb.capture(
             max_per_format=self.policy.per_format_max_bytes,
-            filter_fn=self._collect_filter,
+            filter_fn=make_collect_filter(self.policy, exclude_patterns),
         )
 
         files = _extract_files(snapshot)
@@ -333,7 +391,9 @@ class ClipboardSync:
             except Exception:  # pragma: no cover - 判断失败不能拖垮同步
                 log.exception("判断文件来源失败")
 
-        decision = self.policy.decide(snapshot.items, files=files, skipped=snapshot.skipped)
+        decision = self.policy.decide(
+            snapshot.items, files=files, skipped=snapshot.skipped, exclude_patterns=exclude_patterns
+        )
 
         if decision.action == ACTION_SKIP:
             return decision
@@ -434,6 +494,20 @@ class ClipboardSync:
 
     def _collect_filter(self, fmt: int, name: str, category: str) -> bool:
         return make_collect_filter(self.policy)(fmt, name, category)
+
+    def _exclude_for_owner(self, owner: str) -> "Optional[List[Any]]":
+        """按剪贴板所有者的进程名挑一组丢弃正则。
+
+        匹配不到返回 `None` —— 那表示"用配置里那套全局 `exclude`"，**不是**"什么都不丢"。
+        这样没配 `exclude_by_process` 的人行为完全不变。
+        """
+        if not owner:
+            return None
+        name = owner.strip().lower()
+        for process, patterns in self._exclude_by_process:
+            if process == name:
+                return patterns
+        return None
 
     def _encode_items(self, decision: SyncDecision) -> Optional[List[Dict]]:
         """把决策里的格式编码成待发送的段（含可选压缩）。"""
@@ -552,13 +626,35 @@ class ClipboardSync:
         with self._lock:
             self._pending_clipboard = cache
 
-        # 写剪贴板可能退避重试，放短命线程里做，避免阻塞事件循环
-        threading.Thread(
-            target=self._apply_remote,
-            args=(seq, items),
-            name="netclip-clip-apply",
-            daemon=True,
-        ).start()
+        # 写剪贴板可能退避重试（最坏几秒），放**唯一的**写入线程里做：既不阻塞
+        # 事件循环，也不会出现多个线程同时抢系统剪贴板。
+        self._queue_apply(seq, items)
+
+    def _queue_apply(self, seq: int, items: List[cb.FormatBlob]) -> None:
+        """把一帧排进写入队列。**后到的顶掉前面的** —— 中间态没有价值。"""
+        with self._lock:
+            self._apply_pending = (seq, items)
+        self._ensure_apply_thread()
+        self._apply_wake.set()
+
+    def _apply_loop(self) -> None:
+        """唯一的剪贴板写入者。"""
+        while not self._stop.is_set():
+            if not self._apply_wake.wait(0.25):
+                continue
+            self._apply_wake.clear()
+            #: 内层循环把"写入期间又到的帧"一并吃掉：写一帧可能要好几秒，这期间
+            #: WPS 可能又发了三帧，全都只保留最后那一帧。
+            while not self._stop.is_set():
+                with self._lock:
+                    pending = self._apply_pending
+                    self._apply_pending = None
+                if pending is None:
+                    break
+                try:
+                    self._apply_remote(pending[0], pending[1])
+                except Exception:  # pragma: no cover - 单帧失败不能拖垮写入线程
+                    log.exception("写对端剪贴板内容失败")
 
     def on_files_ready(self, paths: List[str]) -> None:
         """文件通道把文件落盘并校验通过后调用（在 asyncio 线程里）。
@@ -629,7 +725,9 @@ class ClipboardSync:
                 result = None
                 try:
                     result = cb.write_formats(
-                        cb.order_for_paste(file_items, []), open_retry_ms=self.policy_open_retry()
+                        cb.order_for_paste(file_items, []),
+                        open_retry_ms=self.policy_open_retry(),
+                        owner=self.clipboard_owner_hwnd(),
                     )
                 except cb.ClipboardBusy as exc:
                     log.warning("把文件放回剪贴板失败（剪贴板被占用）: %s", exc)
@@ -760,7 +858,11 @@ class ClipboardSync:
         try:
             try:
                 ordered = cb.order_for_paste(writable, [])
-                result = cb.write_formats(ordered, open_retry_ms=self.policy_open_retry())
+                result = cb.write_formats(
+                    ordered,
+                    open_retry_ms=self.policy_open_retry(),
+                    owner=self.clipboard_owner_hwnd(),
+                )
             except cb.ClipboardBusy as exc:
                 self.stats["write_failed"] += 1
                 self.last_error = "剪贴板被占用: %s" % exc
@@ -781,6 +883,23 @@ class ClipboardSync:
             #: 序号在**清除 `_writing` 之前**记下来，别留缝。
             self._last_remote_seq = seq
             self._last_sent_seq = result.sequence  # 也记一份，双保险
+
+            #: **让 OLE 正式接管**（见 `clipboard.bless_clipboard_with_ole`）。
+            #: 它会自检"格式有没有变少"；少了就返回 False，这里立刻把原内容写回去 ——
+            #: 实测 OLE 接管失败时会把剪贴板清空，那比不接管糟得多。
+            if self.ole_finish:
+                if cb.bless_clipboard_with_ole():
+                    self.stats["ole_finished"] = self.stats.get("ole_finished", 0) + 1
+                else:
+                    log.info("OLE 接管未成功，把原内容重写回去")
+                    retry = cb.write_formats(
+                        ordered,
+                        open_retry_ms=self.policy_open_retry(),
+                        owner=self.clipboard_owner_hwnd(),
+                    )
+                    if retry:
+                        result = retry
+                        self._last_sent_seq = retry.sequence
         finally:
             self._writing.clear()
             if result is None and self._watcher is not None:
@@ -803,6 +922,21 @@ class ClipboardSync:
         """写剪贴板的重试序列，可由会话注入真实配置；默认用库内默认值。"""
         retry = getattr(self, "_open_retry_ms", None)
         return retry if retry else cb.DEFAULT_OPEN_RETRY_MS
+
+    def clipboard_owner_hwnd(self) -> int:
+        """要用哪个窗口当**剪贴板所有者**。
+
+        用剪贴板监听线程那个 message-only 窗口：那个线程本来就在抽消息，
+        正好满足"所有者窗口要能收消息"的要求。取不到就返回 0（无主，和以前一样）。
+
+        为什么要指定：无主剪贴板（`OpenClipboard(None)`）和对端 OLE 的粘贴有关系 ——
+        真机对照里 UU远程 送来的内容对端能粘成**可编辑对象**，而它的剪贴板是有主窗口的。
+        """
+        try:
+            hwnd = getattr(self._watcher.listener, "hwnd", None)
+            return int(hwnd or 0)
+        except Exception:  # pragma: no cover - 拿不到就当无主
+            return 0
 
     # ------------------------------------------------------------ 诊断
 
@@ -876,6 +1010,69 @@ def source_label(seq: int) -> str:
 
 _FILE_URL_RE = re.compile(rb"(src|href)\s*=\s*[\"']file:///([^\"']+)[\"']", re.IGNORECASE)
 
+#: `CF_HTML` 头里的偏移项。每个值都是**从数据开头算起的字节位置**。
+#: 消费者（资源管理器、WPS、Word…）是**照着这些数字去切片段**的。
+_CF_HTML_OFFSET_RE = re.compile(
+    rb"(StartHTML|EndHTML|StartFragment|EndFragment|StartSelection|EndSelection):(\d+)"
+)
+
+
+def fixup_cf_html_offsets(data: bytes) -> bytes:
+    """重算 `CF_HTML`（"HTML Format"）头里的偏移量。
+
+    **为什么必须做。** 这个格式的头部是一段 ASCII 的 `名字:十进制偏移`，
+    所有偏移都从数据开头算起。我们内联 `file:///` 图片会把正文改长，**只要正文一变，
+    这些数字就全错了** —— 而消费者按偏移去切片段，切到断的片段就当作坏数据，
+    于是**放弃 HTML、回退到图片**（真机现象：WPS 公式粘过来变成了图片）。
+
+    真机上的直接证据（同一个剪贴板，两台机器各 `clip_probe.py` 一次）::
+
+        发送端 HTML Format: 33411 字节   头里 EndHTML:0000033411   <- 自洽
+        接收端 HTML Format: 96570 字节   头里 EndHTML:0000033411   <- 早就不是这个数了
+
+    片段边界靠 `<!--StartFragment-->` / `<!--EndFragment-->` 这对注释**就地找回**，
+    不依赖原来那些（已经错了的）数字。`StartHTML` 不用动：用同样的宽度写回去，
+    头部长度不变，正文起点自然不变。
+    """
+    if not data.startswith(b"Version:"):
+        return data
+    matches = list(_CF_HTML_OFFSET_RE.finditer(data))
+    if not matches:
+        return data
+
+    #: 所有字段用同一个宽度；重写后头部长度必须**一模一样**，否则正文起点会移动，
+    #: 反而把 StartHTML 也搞错。
+    width = max(len(m.group(2)) for m in matches)
+
+    def marker_offset(marker: bytes, after: bool) -> "Optional[int]":
+        index = data.find(marker)
+        if index < 0:
+            return None
+        return index + len(marker) if after else index
+
+    new_values = {
+        "EndHTML": len(data),
+        "StartFragment": marker_offset(b"<!--StartFragment-->", after=True),
+        "EndFragment": marker_offset(b"<!--EndFragment-->", after=False),
+        "StartSelection": marker_offset(b"<!--StartSelection-->", after=True),
+        "EndSelection": marker_offset(b"<!--EndSelection-->", after=False),
+    }
+
+    for name, value in new_values.items():
+        if value is not None and len(str(value)) > width:
+            #: 宽度不够（10 位十进制 = 10GB 的负载）。宁可不改，也不要把头改坏。
+            log.debug("CF_HTML 偏移 %s=%d 超出原有宽度 %d，放弃重算", name, value, width)
+            return data
+
+    def repl(match: "re.Match[bytes]") -> bytes:
+        name = match.group(1).decode("ascii")
+        value = new_values.get(name)
+        if value is None:
+            return match.group(0)  #: StartHTML 不动；找不到标记的项也不动
+        return b"%s:%0*d" % (match.group(1), width, value)
+
+    return _CF_HTML_OFFSET_RE.sub(repl, data)
+
 
 def inline_html_local_refs(html: bytes) -> bytes:
     """把 HTML Format 里的 `file:///` 本地图片引用内联成 data URI。
@@ -917,10 +1114,15 @@ def inline_html_local_refs(html: bytes) -> bytes:
         return b"%s=%sdata:%s;base64,%s%s" % (attr, quote, mime.encode("ascii"), encoded, quote)
 
     try:
-        return _FILE_URL_RE.sub(repl, html)
+        rewritten = _FILE_URL_RE.sub(repl, html)
     except Exception:  # pragma: no cover - 内联失败不能影响同步
         log.debug("HTML 引用内联失败，原样发送", exc_info=True)
         return html
+    if rewritten == html:
+        return html
+    #: **改完正文必须重算头里的偏移**，否则消费者按旧偏移切到断片段，
+    #: 直接放弃 HTML —— 真机上就是"公式粘过来变成图片"。
+    return fixup_cf_html_offsets(rewritten)
 
 
 # --------------------------------------------------------------------- CF_HDROP

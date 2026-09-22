@@ -217,12 +217,56 @@ verify_sha256 = true
 #   私有格式会连同样式一起搬过去，对端粘贴才是"可编辑对象"而不是死图。
 forward_all = true
 
-# 排除的格式名（正则）。这些格式要么是进程内句柄、要么带本机绝对路径、
-# 要么体积巨大而信息量为零。
+# 排除的格式名（正则）。
+#
+# ★ 这两个是**实测出来**的，别随手改：
+#   * `Ole Private Data` **必须丢** —— 它装的是源进程里那个 OLE 数据对象的封送引用，
+#     搬到对端是悬空引用。对端 OLE 一看到就尝试反封送、失败，于是整个剪贴板对 OLE
+#     客户端都是坏的，WPS 只能退回图片。
+#   * `Link Source` 系列**绝不能排除** —— 少了它们对端 OLE 连可用的东西都没有，
+#     粘贴菜单直接变灰（连图片都粘不了）。
+#
+#   三组真机 A/B（同一个剪贴板，两台各跑一次 tools/clip_probe.py）：
+#
+#     排除                                     接收端格式数  结果
+#     DataObject + Ole Private Data + Link Source*   13     菜单灰，完全粘不了
+#     一条不排                                        18     能粘，但退成图片
+#     DataObject + Ole Private Data（本默认）         16     能粘，可编辑对象
+#
+#   UU远程（GameViewer.exe）的行为就是最后一组：它收到的 16 种格式里，除了这两个
+#   之外其余全部逐字节一致，而且枚举顺序和源端完全一致。
 exclude = [
     "^DataObject$",
     "^Ole Private Data$",
-    "^Link Source.*",
+]
+
+# ★ **按"复制来源进程"切换丢弃列表。**
+#
+# 为什么需要它：同一个 `Ole Private Data` 在不同程序上要求**相反**，静态 `exclude`
+# 无论怎么配都只能满足一边。真机把 3 条排除的正则**枚举了 8 种组合**，结论是：
+#
+#   | Ole Private Data | PPT（wpp.exe） | Word（winword.exe） |
+#   |---|---|---|
+#   | 排掉 | **可编辑** ✅ | **粘不了** ❌ |
+#   | 原样转发 | **退成图片** ❌ | **可以** ✅ |
+#
+# 去掉 `DataObject` / `Link Source.*` 怎么组合都不影响这个结论（都试过）。
+#
+# 机制：`Ole Private Data` 装的是**源进程里那个 OLE 数据对象的封送引用**，
+# 跨机搬过去就是悬空引用。PPT 走 OLE 粘贴，反封送失败就退回图片；
+# 而 Word 的文字粘贴需要剪贴板上有 OLE 数据对象的身份，没有就粘不了。
+# 只有"接收端 OLE 自己生成一份本机有效的"才能两边都好 —— 原生复制和 UU远程 是那一档，
+# 我们做不到（裸 `SetClipboardData` 不会生成它）。
+#
+# 判据用**进程名**（剪贴板所有者）而不是猜格式 —— 那是直接可观测的。
+# 匹配不到就走上面的 `exclude`。进程名按小写、精确匹配文件名。
+exclude_by_process = [
+    # WPS 演示：排掉它，形状/文本框/表格才能粘成可编辑对象
+    { process = "wpp.exe", exclude = ["^Ole Private Data$"] },
+    # 微软 PowerPoint：按同一机制推断，没单独验过
+    { process = "powerpnt.exe", exclude = ["^Ole Private Data$"] },
+    # Word：留着他，文字才粘得了
+    { process = "winword.exe", exclude = [] },
 ]
 
 # 单个格式的负载上限（MB）。超过则**丢弃这一个格式**，其它格式继续同步。
@@ -234,7 +278,24 @@ compress = true
 
 # 把 HTML Format 里的 file:/// 本地图片引用内联成 data: URI。
 # 不开启的话，Excel/PPT 复制过来的图片到对端会变成空占位符。
+#
+# ★ 注意：这是整条链路上**唯一一处主动改写内容**的地方（其它格式都是原样字节转发）。
+#   真机 A/B 已经确认它**不是**"公式粘成图片"的原因（关掉它照样是图片），
+#   而它当初的存在理由**没有实测记录支撑**。要不要默认开，等粘贴问题定了再单独决定。
 inline_html_refs = true
+
+# ★ 实验开关，**默认关**：写完对端剪贴板后让 OLE 正式接管
+#   （`OleGetClipboard` -> `OleSetClipboard` -> `OleFlushClipboard`），
+#   由 OLE 生成属于**本机**的数据对象身份，而不是把源机器的封送引用原样搬过去。
+#
+#   动机：裸 `SetClipboardData` 写出来的剪贴板没有 OLE 数据对象的身份，而 Office/WPS
+#   的粘贴走 `OleGetClipboard`；对照组 UU远程 送来的同一份内容对端粘出来是**可编辑对象**，
+#   它的剪贴板有所有者窗口。
+#
+#   现状：**本机实测不成功** —— `OleSetClipboard` 报 `CLIPBRD_E_CANT_CLOSE`，而且
+#   会把剪贴板清空（接管后只剩 `DataObject`）。所以代码里带了"格式变少就回滚"的自检，
+#   但在真机上证明有用之前不默认打开。
+ole_finish = false
 
 # 允许同步的私有格式名白名单（正则）。留空 = 不加额外限制。
 # 调试期可以只填 ["^PowerPoint", "^MathType"] 收窄范围。

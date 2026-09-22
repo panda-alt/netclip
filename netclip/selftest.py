@@ -476,7 +476,8 @@ def cmd_clip_loop(args: argparse.Namespace) -> int:
         max_payload_mb=8,
         per_format_max_mb=16,
         forward_all=True,
-        exclude=[r"^DataObject$", r"^Ole Private Data$", r"^Link Source.*"],
+        #: 不排除任何格式 —— 和默认配置保持一致。曾经这里排除了
+        #: `DataObject` / `Ole Private Data` / `Link Source.*`，那会让 WPS 粘不了。
     )
 
     created: List[str] = []

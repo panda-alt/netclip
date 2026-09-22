@@ -464,6 +464,43 @@ ole32 = ctypes.WinDLL("ole32", use_last_error=True)
 advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
 
 LRESULT = ctypes.c_ssize_t
+
+#: COM 的 `HRESULT`：`S_OK == 0`，失败是负值。
+HRESULT = ctypes.c_long
+
+# --- 问出"剪贴板是哪个进程放的" -----------------------------------------------
+#
+# 真机 A/B 的结论：同一个 `Ole Private Data` 在 WPS 演示和 Word 上要求**相反** ——
+# PPT 要它不在（否则形状退成图片），Word 要它在（否则文字粘不了）。
+# 判据就用**复制来源进程名**：那是直接可观测的，不用猜格式。
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+kernel32.QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE,
+    wintypes.DWORD,
+    wintypes.LPWSTR,
+    ctypes.POINTER(wintypes.DWORD),
+]
+
+# --- 把剪贴板交给 OLE 重新接管 -----------------------------------------------
+#
+# 裸 `SetClipboardData` 写出来的剪贴板**没有 OLE 数据对象的身份**，而 Office/WPS
+# 的粘贴走的是 `OleGetClipboard`。这三步让 OLE 自己接管，并生成属于**本机**的
+# `Ole Private Data`，而不是把源机器的封送引用原样搬过去（那是悬空引用）。
+# 详见 `clipboard.bless_clipboard_with_ole()` 的说明。
+ole32.OleInitialize.restype = HRESULT
+ole32.OleInitialize.argtypes = [ctypes.c_void_p]
+ole32.OleGetClipboard.restype = HRESULT
+ole32.OleGetClipboard.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+ole32.OleSetClipboard.restype = HRESULT
+ole32.OleSetClipboard.argtypes = [ctypes.c_void_p]
+ole32.OleFlushClipboard.restype = HRESULT
+ole32.OleFlushClipboard.argtypes = []
+
 HHOOK = ctypes.c_void_p
 HGLOBAL = ctypes.c_void_p
 HANDLE = ctypes.c_void_p

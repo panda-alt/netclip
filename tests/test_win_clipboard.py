@@ -223,6 +223,136 @@ def test_unicode_text_has_no_trailing_nul():
     _snapshot_then_restore(body)
 
 
+# --------------------------------------------------------------------- OLE 接管
+
+
+def test_ole_takeover_never_loses_the_clipboard():
+    """**回归测试**：OLE 接管失败时，必须把原内容原样还回来。
+
+    裸 `SetClipboardData` 写出来的剪贴板没有 OLE 数据对象的身份，而 Office/WPS 的
+    粘贴走 `OleGetClipboard`，所以试过"写完再让 OLE 接管一次"。**本机实测这一步会失败**：
+
+        OleSetClipboard = CLIPBRD_E_CANT_CLOSE
+        接管后剪贴板只剩 ['DataObject']   <- 我们写进去的格式全没了
+
+    所以 `bless_clipboard_with_ole()` 收尾时会**核对格式有没有变少**，少了就返回 False。
+    这条测试钉的是：**不管接管成不成功，剪贴板都不能比接管前更少东西**。
+    宁可不要这个改善，也绝不能把用户的剪贴板弄丢。
+    """
+
+    def body():
+        items = [
+            cb.FormatBlob(
+                name="CF_UNICODETEXT", category=cb.CAT_TEXT, data="ole 接管测试".encode("utf-16-le")
+            ),
+            cb.FormatBlob(
+                name="Embed Source", category=cb.CAT_OLE, data=bytes.fromhex("d0cf11e0a1b11ae1") + b"X" * 128
+            ),
+        ]
+        cb.write_formats(items)
+        before = cb._clipboard_format_names()  # noqa: SLF001 - 测试要的就是这个内部量
+
+        cb.bless_clipboard_with_ole()
+
+        after = cb._clipboard_format_names()  # noqa: SLF001
+        lost = before - after
+        if lost:
+            #: 说明接管确实会丢东西 —— 那就必须能靠重写补回来（调用方就是这么做的）
+            cb.write_formats(items)
+            restored = cb._clipboard_format_names()  # noqa: SLF001
+            assert not (before - restored), "接管丢了 %s，重写也补不回来" % sorted(lost)
+        assert cb._clipboard_format_names()  # noqa: SLF001 - 任何时候都不该是空的
+
+    _snapshot_then_restore(body)
+
+
+# --------------------------------------------------------------------- 剪贴板所有者
+
+
+def test_write_formats_can_set_the_clipboard_owner():
+    """**回归测试**：写剪贴板时可以把**所有者窗口**登记进去。
+
+    不指定时所有者是 NULL。而对端（Office/WPS）的粘贴走 `OleGetClipboard`，
+    它要跟所有者打交道。真机对照里唯一还没被动过的差别就是这个：
+
+      | | 剪贴板所有者 |
+      |---|---|
+      | UU远程（对端能粘成**可编辑对象**） | GameViewer.exe（**有窗口**） |
+      | 原生复制 | WPS（有窗口） |
+      | **我们（一直）** | **NULL** |
+
+    所以这里钉住两件事：指定了就真的登记上、不指定就还是无主（不回退）。
+    """
+
+    def body():
+        from netclip.win.msgwin import ClipboardListener
+
+        blob = cb.FormatBlob(
+            name="CF_UNICODETEXT", category=cb.CAT_TEXT, data="owner 测试".encode("utf-16-le")
+        )
+
+        cb.write_formats([blob])
+        assert not w.user32.GetClipboardOwner(), "不指定 owner 时应该是无主（NULL）"
+
+        listener = ClipboardListener(lambda _seq: None)
+        assert listener.start(), "剪贴板监听窗口起不来"
+        try:
+            cb.write_formats([blob], owner=listener.hwnd)
+            assert int(w.user32.GetClipboardOwner() or 0) == int(listener.hwnd), (
+                "指定的所有者窗口没被登记上"
+            )
+        finally:
+            listener.stop()
+
+    _snapshot_then_restore(body)
+
+
+# --------------------------------------------------------------------- 采集顺序
+
+
+def test_capture_preserves_the_clipboard_enumeration_order():
+    """**回归测试**：采集结果的顺序必须和剪贴板上的枚举顺序一致。
+
+    这个顺序会被接收端**原样照搬**去写剪贴板 —— 所以一旦采集时排了序，就等于
+    替消费者重排了格式优先级。真机抓到的对比（同一个剪贴板，两台各跑一次
+    `tools/clip_probe.py`）::
+
+        发送端: DataObject > Kingsoft Data Descriptor > Kingsoft WPS 9.0 Format > …
+        接收端: CF_UNICODETEXT > CF_ENHMETAFILE > DataObject > …
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ 被我们提到了最前面
+
+    根因是 `capture()` 里为了**等价表示去重**而做的"按组优先级读取"排序，泄漏到了
+    `items` 的顺序上。读取顺序和输出顺序是两回事，去重只需要前者。
+    """
+
+    def body():
+        items = [
+            cb.FormatBlob(name="Embed Source", category=cb.CAT_OLE, data=b"A" * 40),
+            cb.FormatBlob(name="HTML Format", category=cb.CAT_HTML, data=b"<html></html>"),
+            cb.FormatBlob(name="CF_UNICODETEXT", category=cb.CAT_TEXT, data="x".encode("utf-16-le")),
+        ]
+        cb.write_formats(items)
+
+        #: **写完剪贴板后"立刻"枚举可能只列出第一种格式** —— 实测（Windows 10）：
+        #: 紧接着写的那次 `EnumClipboardFormats` 只返回 `['Embed Source']`，
+        #: 再调一次才把 6 种全列出来。格式表是异步铺完的，所以先枚举一次当"落定"。
+        with cb.ClipboardSession():
+            cb.enumerate_formats()
+        with cb.ClipboardSession():
+            on_clipboard = [name for _fmt, name in cb.enumerate_formats()]
+        snapshot = cb.capture(max_per_format=1024 * 1024)
+        got = [i.name for i in snapshot.items]
+
+        assert got, "什么都没采集到"
+        assert got == [name for name in on_clipboard if name in set(got)], (
+            "采集顺序 %s 和剪贴板枚举顺序 %s 对不上" % (got, on_clipboard)
+        )
+        #: 最关键的一条：文本**不许**被提到最前面 —— 那正是以前干的事。
+        assert got[0] != "CF_UNICODETEXT", "文本格式又被排到最前面了"
+
+    _snapshot_then_restore(body)
+
+
 def test_registered_format_roundtrip():
     """跨机同步私有格式的基础：按名字注册、原样传字节。"""
 
@@ -670,7 +800,7 @@ def test_capture_retries_a_clipboard_that_looks_completely_empty(monkeypatch):
 class _FakeSession:
     """替掉真的 `ClipboardSession`：不碰系统剪贴板。"""
 
-    def __init__(self, retry_ms=cb.DEFAULT_OPEN_RETRY_MS) -> None:
+    def __init__(self, retry_ms=cb.DEFAULT_OPEN_RETRY_MS, owner: int = 0) -> None:
         pass
 
     def __enter__(self):

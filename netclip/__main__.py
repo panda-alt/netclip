@@ -276,6 +276,44 @@ psk = "change-me-please"
 # --------------------------------------------------------------------- 主运行
 
 
+def _arm_freeze_dump(seconds: float, log) -> None:
+    """按 `--freeze-dump` 打开"卡死取证"。
+
+    **为什么这一个必须留在软件里**（而剪贴板探查是独立脚本）：它要 dump 的是
+    **本进程**所有线程的调用栈。进程整个卡死时，外部脚本根本连不上来 —— 只能由
+    进程自己安排。`faulthandler` 用的是**独立的 C 线程**，**不需要 GIL**，
+    所以即使所有 Python 线程都冻住，它照样能写出每个线程停在哪个调用上。
+
+    **为什么需要它**：真机上出现过"整个进程没声了" —— 日志一个字都不再写（连每 60 秒
+    必打的状态行都停了）、鼠标完全不能动，只能杀掉才恢复。那种卡死下 Python 层的日志
+    全部失效，事后翻日志什么都看不出来。
+
+    写**单独一个文件**而不是进日志：日志会轮转，混进去的大段栈会把日志冲乱，
+    而且轮转时可能正好把它切走。
+    """
+    if seconds <= 0 or seconds is None:
+        return
+    from .config import app_dir
+
+    try:
+        import faulthandler
+
+        path = app_dir() / "netclip-freeze.txt"
+        stream = open(path, "a", encoding="utf-8", buffering=1)
+        faulthandler.enable(file=stream, all_threads=True)
+        stream.write(
+            "\n===== 卡死取证已开启：每 %g 秒 dump 一次全部线程的调用栈 =====\n"
+            "（正常运行时也会定时出现，它只是当时各线程在哪的快照；\n"
+            "  真正要看的是**卡住之后**那几份 —— 每次内容都一样，就说明卡死了。）\n"
+            % (seconds,)
+        )
+        stream.flush()
+        faulthandler.dump_traceback_later(seconds, repeat=True, file=stream)
+        log.info("卡死取证已开启：每 %g 秒写一次线程栈到 %s", seconds, path)
+    except Exception:
+        log.warning("无法开启卡死取证（faulthandler 不可用）", exc_info=True)
+
+
 def cmd_run(args: argparse.Namespace, cfg: Config) -> int:
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -291,6 +329,7 @@ def cmd_run(args: argparse.Namespace, cfg: Config) -> int:
         cfg.logging.backups,
     )
     log.info("netclip %s 启动", __version__)
+    _arm_freeze_dump(args.freeze_dump, log)
     _log_geometry_facts(log)
     _log_privilege_fact(log)
     if args.port_offset:
@@ -507,6 +546,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="把监听端口和对端端口整体偏移这么多（同一台机器上跑两个实例做联调时用）",
+    )
+    parser.add_argument(
+        "--freeze-dump",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help="每 N 秒把所有线程的调用栈写进 netclip-freeze.txt（0=关闭）。"
+        "排查「整个进程卡死、连日志都不写」时用。",
     )
     return parser
 

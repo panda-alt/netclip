@@ -101,6 +101,8 @@ def build_clipboard_sync(
         send=send,
         compress=cfg.clipboard.formats.compress,
         inline_html_refs=cfg.clipboard.formats.inline_html_refs,
+        ole_finish=cfg.clipboard.formats.ole_finish,
+        exclude_by_process=cfg.clipboard.formats.exclude_by_process,
         notify=notify,
         files_handler=files_handler,
     )

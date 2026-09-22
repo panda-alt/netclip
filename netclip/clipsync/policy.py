@@ -139,13 +139,24 @@ class SyncPolicy:
 
     # ------------------------------------------------------------ 格式过滤
 
-    def format_allowed(self, name: str, category: str) -> Tuple[bool, str]:
-        """判断单个格式是否允许传输。返回 (是否允许, 不允许的原因)。"""
+    @staticmethod
+    def compile_exclude(patterns: Sequence[str]) -> List[Pattern]:
+        """把正则字符串编译好。调用方可以**预编译一次**、反复用，避免每次采集都重编译。"""
+        return [re.compile(p) for p in patterns if p]
+
+    def format_allowed(
+        self, name: str, category: str, exclude_patterns: Optional[Sequence[Pattern]] = None
+    ) -> Tuple[bool, str]:
+        """判断单个格式是否允许传输。返回 (是否允许, 不允许的原因)。
+
+        `exclude_patterns` 给定时**替代**配置里的 `exclude` —— 用于"按复制来源进程
+        切换丢弃列表"（见 `bridge.ClipboardSync.publish_local`）。
+        """
         toggle_key = _CATEGORY_TOGGLE.get(category)
         if toggle_key is not None and not self.toggles.get(category, True):
             return False, "该类别已在配置中关闭"
 
-        for pattern in self._exclude:
+        for pattern in self._exclude if exclude_patterns is None else exclude_patterns:
             if pattern.search(name):
                 return False, "匹配 clipboard.formats.exclude"
 
@@ -169,6 +180,7 @@ class SyncPolicy:
         *,
         files: Sequence[Tuple[str, int]] = (),
         skipped: Sequence[Tuple[str, str]] = (),
+        exclude_patterns: Optional[Sequence[Pattern]] = None,
     ) -> SyncDecision:
         """给出同步决策。
 
@@ -176,6 +188,7 @@ class SyncPolicy:
         和可选的 `.category`，所以用任何鸭子类型都能测）。
         `files` 是 [(路径, 大小)]，来自 CF_HDROP。
         `skipped` 是采集阶段就失败的格式 [(名字, 原因)]，原样带进决策结果。
+        `exclude_patterns` 给定时替代配置里的 `exclude`（按来源进程切换时用）。
         """
         decision = SyncDecision(dropped=list(skipped))
         if not self.enabled:
@@ -192,7 +205,7 @@ class SyncPolicy:
             if not size:
                 size = len(getattr(item, "data", b"") or b"")
 
-            allowed, why = self.format_allowed(name, category)
+            allowed, why = self.format_allowed(name, category, exclude_patterns)
             if not allowed:
                 decision.dropped.append((name, why))
                 continue

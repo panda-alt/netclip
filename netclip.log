@@ -1,0 +1,92 @@
+19:50:12.544 INFO    [MainThread    ] netclip                netclip 0.1.0 启动
+19:50:12.544 WARNING [MainThread    ] netclip                无法开启卡死取证（faulthandler 不可用）
+Traceback (most recent call last):
+  File "C:\Users\zxy\Documents\Python\Temp\netclip\netclip\__main__.py", line 298, in _arm_freeze_dump
+    path = app_dir() / "netclip-freeze.txt"
+NameError: name 'app_dir' is not defined
+19:50:12.547 INFO    [MainThread    ] netclip                DPI 感知: 已是 每显示器感知(PER_MONITOR)，无需设置
+19:50:12.547 INFO    [MainThread    ] netclip                屏幕(进程视角): 主屏 1920x1200 @ (0,0) | 虚拟桌面 1920x1200 @ (0,0) | 系统 DPI 144 (1.50x) | 显示器数 1
+19:50:12.547 INFO    [MainThread    ] netclip                权限级别: 普通用户 —— 受 Windows UIPI 限制，任务管理器等**提权窗口**收不到转发的鼠标/键盘（现象：移到那个窗口上就卡住）。需要控制它们时用 start.bat 第 10 项以管理员重启，或用第 9 项安装【最高权限】自启。
+19:50:12.547 INFO    [MainThread    ] netclip                
+设备名       : desktop-slave
+对端         : 192.168.200.47:24800
+监听端口     : input=24800 clip=24801 file=24802
+摆放关系     : 对端在上（对齐 center）
+本机屏幕     : 自动探测
+对端屏幕     : (0,0 1920x1080)
+文件同步阈值 : 200 MB（超过时 ask）
+剪贴板       : 启用 | 全格式转发=True | 单格式上限=100MB
+19:50:12.548 WARNING [MainThread    ] netclip                security.psk 仍是默认值！请改成两台机器一致的随机字符串，否则可能连到别人的 netclip。
+19:50:12.718 INFO    [MainThread    ] netclip.core.router    热键已登记: ctrl+alt+home -> recapture
+19:50:12.718 INFO    [MainThread    ] netclip.core.router    热键已登记: ctrl+alt+pause -> toggle
+19:50:12.720 ERROR   [netclip-net   ] netclip.net            [input] 监听 0.0.0.0:24800 失败: [Errno 10048] error while attempting to bind on address ('0.0.0.0', 24800): 通常每个套接字地址(协议/网络地址/端口)只允许使用一次。
+19:50:12.721 ERROR   [netclip-net   ] netclip.net            [clip] 监听 0.0.0.0:24801 失败: [Errno 10048] error while attempting to bind on address ('0.0.0.0', 24801): 通常每个套接字地址(协议/网络地址/端口)只允许使用一次。
+19:50:12.721 INFO    [netclip-hooks ] netclip.win.hooks      钩子线程已就绪 (tid=36188): 鼠标=已安装 键盘=已安装
+19:50:12.723 INFO    [netclip-router] netclip.core.router    输入路由已启动: 对端在本机上侧（垂直轴穿越）| 本机=(0,0 1920x1200) 对端=(0,0 1920x1080) 边缘带宽=2px
+19:50:12.723 ERROR   [netclip-net   ] netclip.net            [file] 监听 0.0.0.0:24802 失败: [Errno 10048] error while attempting to bind on address ('0.0.0.0', 24802): 通常每个套接字地址(协议/网络地址/端口)只允许使用一次。
+19:50:12.723 INFO    [MainThread    ] netclip.core.watchdog  看门狗已启动（超时判定 6.0s）
+19:50:12.726 INFO    [netclip-clip  ] netclip.win.msgwin     剪贴板监听已启动 (tid=28908)
+19:50:12.726 INFO    [MainThread    ] netclip.clipsync       剪贴板同步已启动
+19:50:12.727 INFO    [MainThread    ] netclip.core.session   netclip 已启动
+19:50:12.727 INFO    [MainThread    ] netclip                8 秒后自动退出（--seconds）
+19:50:12.727 INFO    [MainThread    ] netclip                运行中。Ctrl+C 退出。热键: 回拉=ctrl+alt+home 暂停/恢复=ctrl+alt+pause
+19:50:12.727 INFO    [MainThread    ] netclip                已按 --no-tray 禁用系统托盘
+19:50:13.084 WARNING [netclip-net   ] netclip.net            [clip] 与 clip@192.168.200.47:24801 握手失败: 0 bytes read on a total of 14 expected bytes
+19:50:13.084 WARNING [netclip-net   ] netclip.net            [input] 与 input@192.168.200.47:24800 握手失败: 0 bytes read on a total of 14 expected bytes
+19:50:13.084 WARNING [netclip-net   ] netclip.net            [file] 与 file@192.168.200.47:24802 握手失败: 0 bytes read on a total of 14 expected bytes
+19:50:16.442 WARNING [netclip-net   ] netclip.net            [input] 与 input@192.168.200.47:24800 握手失败: 0 bytes read on a total of 14 expected bytes
+19:50:16.443 WARNING [netclip-net   ] netclip.net            [file] 与 file@192.168.200.47:24802 握手失败: 0 bytes read on a total of 14 expected bytes
+19:50:16.443 WARNING [netclip-net   ] netclip.net            [clip] 与 clip@192.168.200.47:24801 握手失败: 0 bytes read on a total of 14 expected bytes
+19:50:19.785 WARNING [netclip-net   ] netclip.net            [input] 与 input@192.168.200.47:24800 握手失败: 0 bytes read on a total of 14 expected bytes
+19:50:19.785 WARNING [netclip-net   ] netclip.net            [clip] 与 clip@192.168.200.47:24801 握手失败: 0 bytes read on a total of 14 expected bytes
+19:50:19.786 WARNING [netclip-net   ] netclip.net            [file] 与 file@192.168.200.47:24802 握手失败: 0 bytes read on a total of 14 expected bytes
+19:50:20.774 INFO    [MainThread    ] netclip.core.session   正在停止 netclip（正常退出）…
+19:50:20.775 INFO    [MainThread    ] netclip.core.router    控制权已交回本机（正常退出）
+19:50:20.777 INFO    [netclip-clip  ] netclip.win.msgwin     剪贴板监听已停止
+19:50:21.008 INFO    [MainThread    ] netclip.clipsync       剪贴板同步已停止
+19:50:21.009 INFO    [netclip-hooks ] netclip.win.hooks      钩子线程已退出
+19:50:21.014 INFO    [MainThread    ] netclip.win.inject     已释放残留按键: LCtrl, RCtrl, LShift, RShift, LAlt, RAlt, LWin, RWin
+19:50:31.875 INFO    [MainThread    ] netclip                netclip 0.1.0 启动
+19:50:31.876 INFO    [MainThread    ] netclip                卡死取证已开启：每 2 秒写一次线程栈到 C:\Users\zxy\Documents\Python\Temp\netclip\netclip-freeze.txt
+19:50:31.879 INFO    [MainThread    ] netclip                DPI 感知: 已是 每显示器感知(PER_MONITOR)，无需设置
+19:50:31.879 INFO    [MainThread    ] netclip                屏幕(进程视角): 主屏 1920x1200 @ (0,0) | 虚拟桌面 1920x1200 @ (0,0) | 系统 DPI 144 (1.50x) | 显示器数 1
+19:50:31.879 INFO    [MainThread    ] netclip                权限级别: 普通用户 —— 受 Windows UIPI 限制，任务管理器等**提权窗口**收不到转发的鼠标/键盘（现象：移到那个窗口上就卡住）。需要控制它们时用 start.bat 第 10 项以管理员重启，或用第 9 项安装【最高权限】自启。
+19:50:31.880 INFO    [MainThread    ] netclip                
+设备名       : desktop-slave
+对端         : 192.168.200.47:24800
+监听端口     : input=24800 clip=24801 file=24802
+摆放关系     : 对端在上（对齐 center）
+本机屏幕     : 自动探测
+对端屏幕     : (0,0 1920x1080)
+文件同步阈值 : 200 MB（超过时 ask）
+剪贴板       : 启用 | 全格式转发=True | 单格式上限=100MB
+19:50:31.880 WARNING [MainThread    ] netclip                security.psk 仍是默认值！请改成两台机器一致的随机字符串，否则可能连到别人的 netclip。
+19:50:31.970 INFO    [MainThread    ] netclip.core.router    热键已登记: ctrl+alt+home -> recapture
+19:50:31.970 INFO    [MainThread    ] netclip.core.router    热键已登记: ctrl+alt+pause -> toggle
+19:50:31.971 ERROR   [netclip-net   ] netclip.net            [input] 监听 0.0.0.0:24800 失败: [Errno 10048] error while attempting to bind on address ('0.0.0.0', 24800): 通常每个套接字地址(协议/网络地址/端口)只允许使用一次。
+19:50:31.972 ERROR   [netclip-net   ] netclip.net            [clip] 监听 0.0.0.0:24801 失败: [Errno 10048] error while attempting to bind on address ('0.0.0.0', 24801): 通常每个套接字地址(协议/网络地址/端口)只允许使用一次。
+19:50:31.973 ERROR   [netclip-net   ] netclip.net            [file] 监听 0.0.0.0:24802 失败: [Errno 10048] error while attempting to bind on address ('0.0.0.0', 24802): 通常每个套接字地址(协议/网络地址/端口)只允许使用一次。
+19:50:31.974 INFO    [netclip-hooks ] netclip.win.hooks      钩子线程已就绪 (tid=39496): 鼠标=已安装 键盘=已安装
+19:50:31.975 INFO    [netclip-router] netclip.core.router    输入路由已启动: 对端在本机上侧（垂直轴穿越）| 本机=(0,0 1920x1200) 对端=(0,0 1920x1080) 边缘带宽=2px
+19:50:31.976 INFO    [MainThread    ] netclip.core.watchdog  看门狗已启动（超时判定 6.0s）
+19:50:31.978 INFO    [netclip-clip  ] netclip.win.msgwin     剪贴板监听已启动 (tid=28140)
+19:50:31.979 INFO    [MainThread    ] netclip.clipsync       剪贴板同步已启动
+19:50:31.979 INFO    [MainThread    ] netclip.core.session   netclip 已启动
+19:50:31.980 INFO    [MainThread    ] netclip                8 秒后自动退出（--seconds）
+19:50:31.980 INFO    [MainThread    ] netclip                运行中。Ctrl+C 退出。热键: 回拉=ctrl+alt+home 暂停/恢复=ctrl+alt+pause
+19:50:31.980 INFO    [MainThread    ] netclip                已按 --no-tray 禁用系统托盘
+19:50:32.331 WARNING [netclip-net   ] netclip.net            [clip] 与 clip@192.168.200.47:24801 握手失败: 0 bytes read on a total of 14 expected bytes
+19:50:32.332 WARNING [netclip-net   ] netclip.net            [file] 与 file@192.168.200.47:24802 握手失败: 0 bytes read on a total of 14 expected bytes
+19:50:32.332 WARNING [netclip-net   ] netclip.net            [input] 与 input@192.168.200.47:24800 握手失败: 0 bytes read on a total of 14 expected bytes
+19:50:35.678 WARNING [netclip-net   ] netclip.net            [file] 与 file@192.168.200.47:24802 握手失败: 0 bytes read on a total of 14 expected bytes
+19:50:35.678 WARNING [netclip-net   ] netclip.net            [input] 与 input@192.168.200.47:24800 握手失败: 0 bytes read on a total of 14 expected bytes
+19:50:35.678 WARNING [netclip-net   ] netclip.net            [clip] 与 clip@192.168.200.47:24801 握手失败: 0 bytes read on a total of 14 expected bytes
+19:50:39.036 WARNING [netclip-net   ] netclip.net            [clip] 与 clip@192.168.200.47:24801 握手失败: 0 bytes read on a total of 14 expected bytes
+19:50:39.037 WARNING [netclip-net   ] netclip.net            [input] 与 input@192.168.200.47:24800 握手失败: 0 bytes read on a total of 14 expected bytes
+19:50:39.037 WARNING [netclip-net   ] netclip.net            [file] 与 file@192.168.200.47:24802 握手失败: 0 bytes read on a total of 14 expected bytes
+19:50:40.026 INFO    [MainThread    ] netclip.core.session   正在停止 netclip（正常退出）…
+19:50:40.027 INFO    [MainThread    ] netclip.core.router    控制权已交回本机（正常退出）
+19:50:40.028 INFO    [netclip-clip  ] netclip.win.msgwin     剪贴板监听已停止
+19:50:40.262 INFO    [MainThread    ] netclip.clipsync       剪贴板同步已停止
+19:50:40.266 INFO    [netclip-hooks ] netclip.win.hooks      钩子线程已退出
+19:50:40.270 INFO    [MainThread    ] netclip.win.inject     已释放残留按键: LCtrl, RCtrl, LShift, RShift, LAlt, RAlt, LWin, RWin
