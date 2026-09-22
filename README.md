@@ -14,7 +14,13 @@
 
 ## 必改的配置项
 
-复制 `config.example.toml` 为 `config.toml`（`start.bat` 发现没有会替你生成），
+`config.toml` **必须和 `netclip.exe` 放在同一个目录**（这个文件每台机器都不一样，
+所以没有打进 exe；从源码跑就是项目根目录）。第一次运行先让它生成一份：
+
+```powershell
+netclip.exe --gen-config     # 在 exe 旁边写出 config.toml
+```
+
 然后**两台机器都要改**下面这几项。填错的表现往往不是报错，而是"连不上"或者
 "鼠标像被弹簧拉住"，所以先按表核对一遍：
 
@@ -62,9 +68,11 @@ psk = "换成一个随机字符串"    # ★ 两台必须完全一致
 改完先校验，再启动：
 
 ```powershell
-python -m netclip --check          # 只校验配置，打印几何预演
-python -m netclip                  # 启动
+netclip.exe --check                # 只校验配置，打印几何预演
+netclip.exe                        # 启动（托盘图标在右下角）
 ```
+
+（从源码跑的话，把上面的 `netclip.exe` 换成 `python -m netclip`。）
 
 ---
 
@@ -94,9 +102,10 @@ Deskflow 有完全相同的 issue
 
 **解法**：让 netclip 提权运行。
 
-- 临时：`start.bat` **第 10 项**（以管理员身份重启）
-- 日常：`start.bat` **第 9 项** 安装【最高权限】自启 —— 登录时由系统直接提权启动、
-  不弹 UAC，最省事
+- **跑 exe**：右键 `netclip.exe` → **以管理员身份运行**
+- **跑源码**：`start.bat` **第 10 项**（以管理员身份重启启动器）
+- **日常（推荐）**：装成【最高权限】的登录自启 —— 由系统在登录时直接提权启动、
+  不弹 UAC，最省事。exe 建计划任务、源码用 `start.bat` 第 9 项，见《开机自启》
 
 **两台机器都要提权**才对称。启动日志里有一行 `权限级别:` 直接告诉你当前是哪种，不用猜：
 
@@ -108,8 +117,17 @@ Deskflow 有完全相同的 issue
 
 ## 开机自启
 
-用 `start.bat` 的**第 9 项**（Windows 计划任务，登录时启动）。它会问你一个关键问题：
-**是否以最高权限运行**。
+**跑 exe 的话，直接建一个计划任务就行**（不需要 `start.ps1` / `netclip_task.vbs` 那套脚本）：
+
+| 计划任务项 | 填什么 |
+|---|---|
+| 操作 → 程序 | `C:\...\dist\netclip\netclip.exe` |
+| 操作 → 起始于 | `C:\...\dist\netclip`（exe 所在目录） |
+| 触发器 | 登录时（建议加 30 秒延迟） |
+| 常规 | 勾选 **使用最高权限运行**、**只在用户登录时运行** |
+
+**从源码跑**用 `start.bat` 的**第 9 项**（同一个计划任务，只是操作填 `pythonw.exe -m netclip`）。
+它会问你一个关键问题：**是否以最高权限运行**。
 
 - **是（推荐）**：登录时由系统直接提权启动，**不弹 UAC**，而且能控制任务管理器这类
   提权窗口（见《权限》一节）。注册这一步本身需要管理员，所以要先走第 10 项。
@@ -130,7 +148,7 @@ Register-ScheduledTask -TaskName netclip -Action $action -Trigger $trigger -Sett
 
 > 用 `pythonw.exe` 而不是 `python.exe`，否则每次登录都会弹一个黑窗口。
 
-### 手动加计划任务：用 `netclip_task.vbs`
+### 手动加计划任务：用 `netclip_task.vbs`（源码方式）
 
 想自己在「任务计划程序」里配，用仓库根目录的 **`netclip_task.vbs`**：
 
@@ -163,7 +181,32 @@ Register-ScheduledTask -TaskName netclip -Action $action -Trigger $trigger -Sett
 
 ## 快速开始
 
-### 方式一：双击 `start.bat`（推荐）
+### 方式一：直接运行 `netclip.exe`（推荐）
+
+打包好的目录在 **`dist\netclip\`**（27 个文件、约 14 MB，入口是 `netclip.exe`）：
+
+```powershell
+cd dist\netclip
+.\netclip.exe --gen-config     # 第一次：在 exe 旁边生成 config.toml
+# 按《必改的配置项》改 config.toml
+.\netclip.exe --check          # 校验
+.\netclip.exe                  # 启动
+```
+
+**双击 `netclip.exe` 就能启动**：后台常驻、没有控制台窗口，全部操作走右下角托盘图标
+（暂停共享、把光标拉回本机、打开日志、退出）。
+
+**目标机器不需要装 Python** —— 整个运行时（`python310.dll`、标准库、`VCRUNTIME140.dll`）
+都在 `_internal\` 里。把 `dist\netclip\` 整个文件夹复制过去、改好 `config.toml` 即可
+（`dist` 里现成有一份压好的 `netclip_win64_0.01.zip`，就是这 27 个文件，拷过去解压也能用）。
+
+> - 第一次直接双击、旁边又没有 `config.toml` 时，程序会退出并提示 `配置文件不存在` ——
+>   先跑一次 `--gen-config` 就好。
+> - 要操作任务管理器这类提权窗口，右键 **以管理员身份运行**（原因见《权限》）。
+> - 开机自启见《开机自启》：计划任务直接指向 `netclip.exe`。
+> - exe 可能被杀毒软件误报（PyInstaller 的通病），遇到了把 `dist` 目录加白名单。
+
+### 方式二：双击 `start.bat`（从源码跑）
 
 双击 `start.bat` 会出现一个中文菜单：
 
@@ -188,14 +231,14 @@ Register-ScheduledTask -TaskName netclip -Action $action -Trigger $trigger -Sett
 ```
 
 它会自己找 Python、检查配置（没有 `config.toml` 就从示例生成并打开记事本让你改）、
-并给出中文错误提示。**日常使用就选 1**：后台运行，没有控制台窗口，
-所有操作走右下角托盘图标（右键菜单可以暂停共享、把光标拉回本机、打开日志、退出）。
+并给出中文错误提示。**这种方式跑的是源码**（`python -m netclip`），改完 `.py`
+立刻生效、不用重新打包 —— 调试用它，日常用 exe。
 
 > `start.bat` 本身是**纯英文 ASCII** 的，一行中文都不输出。原因写在文件注释里：
 > cmd.exe 按系统 ANSI 代码页逐字节读 `.bat`，中文注释在这种解释方式下会被撕裂，
 > 碎片甚至会被当成命令执行。所有中文提示都放在 `start.ps1` 里（带 UTF-8 BOM）。
 
-### 方式二：命令行
+### 方式三：命令行（源码）
 
 按《必改的配置项》改好 `config.toml` 之后：
 
@@ -226,6 +269,8 @@ python -m netclip [选项]
   --port-offset N      所有端口整体偏移 N（同机跑两个实例联调用）
 ```
 
+跑 exe 的话把 `python -m netclip` 换成 `netclip.exe`，选项完全一样。
+
 ### 自检工具
 
 ```powershell
@@ -240,6 +285,9 @@ python -m netclip.selftest loop --seconds 10 # 连通性：连上对端收发帧
 python -m netclip.selftest warpguard         # 回声防护：确认自己挪光标不会被当成用户输入转发
 python -m netclip.selftest inject            # 注入识别：确认自己的注入不会被当成真实输入
 ```
+
+自检也打进了 exe，用法是 `netclip.exe --selftest env`（子命令名照上面对应：
+`netclip.exe --selftest keys --seconds 8`）。
 
 `loop` / `warpguard` / `inject` 这三个是**定向**排查工具，各针对一类具体的坏点，
 比"整体不工作"这种描述有用得多：
@@ -393,6 +441,9 @@ python tools\clip_probe.py     # 独立脚本，不进软件、不进 exe
 
 按顺序做，每步确认后再进行下一步。**不要跳过前面的步骤直接测鼠标共享** ——
 出问题时会分不清是网络、钩子还是几何的问题。
+
+> 下面命令用的是源码形式（`python -m ...`）。跑 exe 就把 `python -m netclip.selftest`
+> 换成 `netclip.exe --selftest`、`python -m netclip` 换成 `netclip.exe`。
 
 1. **连通性**
    ```powershell
@@ -1172,7 +1223,8 @@ netclip 自己有个 `netclip-staging-cleanup` 线程，每 `max(60s, TTL/4)` �
 
 ## 打包成 exe
 
-原来的部署方式是"把整个目录复制到另一台机器"，那里面有源码、测试、脚本上百个文件。
+**日常使用推荐直接跑 exe**（见《快速开始》方式一）。发布给另一台机器只需要
+`dist\netclip\` 那 27 个文件，而不是整个源码树（几百个文件）。
 
 ```powershell
 python tools/build_exe.py            # 默认：目录版 dist\netclip\（27 个文件，13.8 MB）
@@ -1194,15 +1246,8 @@ netclip.exe                  # 启动（托盘图标照常）
 netclip.exe --selftest keys --seconds 8    # 自检也进了 exe
 ```
 
-**开机自启**在 exe 场景下更简单 —— 计划任务的操作直接填：
-
-| | |
-|---|---|
-| 程序 | `C:\...\netclip\netclip.exe` |
-| 起始于 | `C:\...\netclip`（exe 所在目录） |
-| 勾选 | **使用最高权限运行**、**只在用户登录时运行** |
-
-不需要 `start.ps1` / `netclip_task.vbs` 那套脚本了。
+**开机自启**见《开机自启》—— 计划任务的操作直接填 `netclip.exe` 和它所在目录，
+不需要 `start.ps1` / `netclip_task.vbs` 那套脚本。
 
 ### 为什么默认是**目录版**而不是单文件
 
@@ -1290,6 +1335,8 @@ tools/               独立脚本 —— **不进 exe**，只在仓库里跑
   make_icon.py       从 PNG 生成多尺寸 .ico
   fix_ps1_encoding.py  给 .ps1 补回 UTF-8 BOM（edit 工具会把它吃掉）
 config.example.toml  带中文注释的完整示例
+start.bat / start.ps1  源码启动器（菜单、提权、开机自启）
+dist/netclip/        打包产物（**日常用这个**：netclip.exe + _internal/ + config.toml）
 ```
 
 ---
